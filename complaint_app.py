@@ -3,7 +3,7 @@ from openai import OpenAI
 
 # ========== 配置区 ==========
 # 正式部署到云端时，这里改成 st.secrets["API_KEY"]，本地测试先用写死的 key
-API_KEY = "sk-fd3853a202624974a06b135fb8c2b352"  # 记得替换
+API_KEY =st.secrets["API_KEY"]  # 记得替换
 MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
 # ============================
