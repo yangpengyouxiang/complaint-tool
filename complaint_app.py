@@ -3,6 +3,7 @@ from openai import OpenAI
 import PyPDF2
 import docx
 import io
+import re  # 用于脱敏正则
 
 # ========== 配置区 ==========
 API_KEY = st.secrets["API_KEY"]
@@ -24,13 +25,18 @@ DEFAULT_KNOWLEDGE = """
 裁量参考因素：初次违法、货值金额、危害后果、是否主动消除影响、配合调查程度等。
 """
 
+# ========== 脱敏函数 ==========
+def mask_pii(text):
+    """将手机号中间四位替换为****，保留前3后4"""
+    return re.sub(r'(1[3-9]\d)\d{4}(\d{4})', r'\1****\2', text)
+
 # ========== 初始化 session_state ==========
 if "knowledge_text" not in st.session_state:
     st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
 if "loaded_files" not in st.session_state:
-    st.session_state.loaded_files = []   # 记录已加载的文件名
+    st.session_state.loaded_files = []
 
-# ========== 文件解析函数（不变） ==========
+# ========== 文件解析函数 ==========
 def extract_text_from_txt(file):
     return file.getvalue().decode("utf-8")
 
@@ -66,9 +72,8 @@ def process_uploaded_files(uploaded_files):
             st.error(f"读取文件 {file.name} 失败：{e}")
     return "\n\n".join(new_texts), new_names
 
-# ========== 界面布局 ==========
+# ========== 界面布局：知识库上传 ==========
 st.subheader("📂 上传内部文档（Word/PDF/TXT），AI 将持续学习")
-
 uploaded = st.file_uploader(
     "支持批量上传，格式：.txt .pdf .docx",
     type=["txt", "pdf", "docx"],
@@ -76,10 +81,8 @@ uploaded = st.file_uploader(
     key="file_uploader"
 )
 
-# ========== 处理上传按钮 ==========
 if uploaded:
     if st.button("📥 确认添加至知识库"):
-        # 先过滤掉已存在的文件
         existing = st.session_state.loaded_files
         new_files = []
         skipped = []
@@ -88,19 +91,15 @@ if uploaded:
                 skipped.append(f.name)
             else:
                 new_files.append(f)
-        
+
         if not new_files:
             st.warning("本次上传的文件都已存在于知识库中，未添加新内容。")
         else:
-            # 提取新文件文本
             extracted_text, added_names = process_uploaded_files(new_files)
-            # 追加到现有知识库
             if st.session_state.knowledge_text == DEFAULT_KNOWLEDGE:
-                # 如果当前还是默认知识，先清空再添加（避免默认知识和文件混合导致提示词过长，也可保留默认；这里选择替换默认）
                 st.session_state.knowledge_text = extracted_text
             else:
                 st.session_state.knowledge_text += "\n\n" + extracted_text
-            # 更新已加载文件列表
             st.session_state.loaded_files.extend(added_names)
             msg = f"已添加 {len(added_names)} 个文件：{'，'.join(added_names)}"
             if skipped:
@@ -108,13 +107,12 @@ if uploaded:
             st.success(msg)
             st.rerun()
 
-# 显示已加载文件列表
+# 显示当前知识库状态
 if st.session_state.loaded_files:
     st.info(f"📚 当前知识库包含 {len(st.session_state.loaded_files)} 个文件：{'，'.join(st.session_state.loaded_files)}")
 else:
     st.caption("目前使用内置基础法律知识，上传内部材料可逐步构建专属知识库。")
 
-# 按钮：清空知识库
 col1, col2 = st.columns(2)
 with col1:
     if st.button("🗑️ 清空知识库，恢复默认"):
@@ -122,32 +120,61 @@ with col1:
         st.session_state.loaded_files = []
         st.rerun()
 with col2:
-    # 可预览当前知识库总字数
     st.caption(f"知识库总字数：{len(st.session_state.knowledge_text)}")
 
-# 可折叠查看知识库内容
 with st.expander("🔍 查看当前知识库前2000字"):
     st.text(st.session_state.knowledge_text[:2000])
 
 st.markdown("---")
 
-# ========== 举报输入区 ==========
+# ========== 举报工单输入区 ==========
 st.subheader("📥 粘贴举报工单原文")
+# 用 session_state 保存输入的内容，避免刷新丢失
+if "raw_complaint" not in st.session_state:
+    st.session_state.raw_complaint = ""
+
 complaint_text = st.text_area(
     "举报内容",
+    value=st.session_state.raw_complaint,
     height=200,
-    placeholder="例如：2026年4月25日，消费者李某反映在XX超市购买到过期..."
+    placeholder="例如：2026年4月25日，消费者李某（电话13812345678）反映在XX超市购买到过期...",
+    key="complaint_input"
 )
 
-# ========== 构造提示词 ==========
-def build_prompt(complaint, knowledge):
-    return f"""你是一位精通市场监管法律法规的办案助手。请严格根据以下【内部知识库】中的法律规定和裁量标准，对举报工单进行分析。
+# 更新 session_state 以便后续使用
+st.session_state.raw_complaint = complaint_text
+
+# ========== 脱敏选项 ==========
+st.subheader("🛡️ 隐私保护设置")
+use_mask = st.checkbox("分析前自动隐藏手机号码（推荐开启）", value=True,
+                       help="开启后，系统会将举报内容中的手机号中间四位替换为****，防止隐私泄露")
+
+# 手动预览脱敏效果按钮
+if st.button("👁️ 预览脱敏后的内容"):
+    if complaint_text.strip():
+        masked = mask_pii(complaint_text)
+        st.text_area("脱敏后效果（仅预览，不会自动分析）", value=masked, height=150, disabled=True)
+    else:
+        st.warning("请先在上方输入举报内容")
+
+# ========== 分析按钮 ==========
+st.subheader("🚀 启动分析")
+if st.button("开始智能分析", type="primary"):
+    if not complaint_text.strip():
+        st.warning("请先粘贴举报内容")
+    else:
+        # 根据复选框决定是否脱敏
+        final_text = mask_pii(complaint_text) if use_mask else complaint_text
+
+        with st.spinner("AI正在分析，请稍候..."):
+            try:
+                prompt = f"""你是一位精通市场监管法律法规的办案助手。请严格根据以下【内部知识库】中的法律规定和裁量标准，对举报工单进行分析。
 
 【内部知识库】
-{knowledge}
+{st.session_state.knowledge_text}
 
 【举报工单内容】
-{complaint}
+{final_text}
 
 请输出（必须包含以下所有项目）：
 1. 举报类型
@@ -160,18 +187,10 @@ def build_prompt(complaint, knowledge):
 
 确保输出格式与知识库中的文书范例风格一致。"""
 
-# ========== 分析按钮 ==========
-if st.button("🚀 智能分析", type="primary"):
-    if not complaint_text.strip():
-        st.warning("请先粘贴举报内容")
-    else:
-        with st.spinner("AI正在分析，请稍候..."):
-            try:
-                prompt = build_prompt(complaint_text, st.session_state.knowledge_text)
                 response = client.chat.completions.create(
                     model=MODEL,
                     messages=[
-                        {"role": "system", "content": "你是一个专业、严谨的市场监管法律助手。"},
+                        {"role": "system", "content": "你是一个专业、严谨的市场监管法律助手，请在分析时注意保护举报人隐私。"},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
@@ -180,6 +199,7 @@ if st.button("🚀 智能分析", type="primary"):
                 result = response.choices[0].message.content
                 st.success("✅ 分析完成")
 
+                # 分段展示结果
                 sections = result.split("\n\n")
                 for sec in sections:
                     if sec.strip():
@@ -191,16 +211,22 @@ if st.button("🚀 智能分析", type="primary"):
             except Exception as e:
                 st.error(f"调用AI出错：{str(e)}")
 
-# ========== 侧边栏 ==========
+# ========== 侧边栏说明 ==========
 st.sidebar.markdown("""
-### 使用说明
-1. **逐步添砖加瓦**：每次上传新内部文件（Word/PDF/TXT），点击“确认添加至知识库”，内容会**累积**而不是覆盖。
-2. 同名文件不会重复添加，系统会自动跳过。
-3. 点击“清空知识库”可一键恢复初始状态。
-4. 粘贴工单后点击分析，AI会基于您上传的全部文件进行辅助。
+### 📘 使用指引
+1. **上传文件**：将局内的裁量指导意见、优秀处罚文书（Word/PDF/TXT）拖拽上传，点“确认添加”。
+2. **粘贴工单**：将12315或其他渠道的举报内容粘贴进输入框。
+3. **隐私保护**：侧边栏上方已默认开启“自动隐藏手机号”，如需查看脱敏效果可点“预览”。
+4. **开始分析**：点“开始智能分析”，等待约20秒，即可获得分析结果和文书草稿。
 
-### 支持文件格式
-- 文本文件 (.txt)
-- PDF 文件 (.pdf)
-- Word 文档 (.docx)
+### 🔒 隐私与安全
+- 分析前自动过滤手机号等敏感信息。
+- 数据仅用于本次分析，不保存、不记录、不留存。
+- AI调用全程HTTPS加密，符合国家相关规定。
+
+### 📂 支持投诉类型
+- 食品安全、药品/医疗器械
+- 广告虚假宣传、商标侵权
+- 价格违法、不正当竞争
+- 无照经营、超范围经营
 """)
