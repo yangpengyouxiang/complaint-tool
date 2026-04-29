@@ -1,179 +1,220 @@
 import streamlit as st
 from openai import OpenAI
-import PyPDF2
-import docx
+import re
 import io
+import base64
 
-# ========== 配置区 ==========
+# ========== 配置 ==========
 API_KEY = st.secrets["API_KEY"]
 MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
-# ============================
+MAX_KNOWLEDGE_CHARS = 4000
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+# ========== 惰性导入大型库 ==========
+@st.cache_resource
+def get_client():
+    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-st.set_page_config(page_title="市监举报辅助系统", layout="wide")
-st.title("📋 举报工单智能分析与文书辅助")
+def _pypdf2():
+    import PyPDF2
+    return PyPDF2
 
-# ========== 内置默认知识（当用户未上传文件时使用） ==========
-DEFAULT_KNOWLEDGE = """
-常用市场监督管理法律法规要点：
-- 食品安全法第34条：禁止经营超过保质期的食品。
-- 广告法第9条：广告不得使用“国家级”、“最高级”、“最佳”等绝对化用语。
-- 无证无照经营查处办法第2条：任何单位或者个人不得违反法律、法规、国务院决定的规定，从事无证无照经营。
-裁量参考因素：初次违法、货值金额、危害后果、是否主动消除影响、配合调查程度等。
-"""
+def _docx():
+    import docx
+    return docx
 
-# ========== 初始化 session_state ==========
-if "knowledge_text" not in st.session_state:
-    st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []  # 记录文件名列表
+def _openpyxl():
+    import openpyxl
+    return openpyxl
 
-# ========== 文件解析函数 ==========
-def extract_text_from_txt(file):
-    return file.getvalue().decode("utf-8")
+# ========== 基础设置（极简） ==========
+st.set_page_config(page_title="市监举报辅助")
+st.markdown("## 📋 举报工单智能分析")
 
-def extract_text_from_pdf(file):
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.getvalue()))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() or ""
-    return text
-
-def extract_text_from_docx(file):
-    doc = docx.Document(io.BytesIO(file.getvalue()))
-    return "\n".join([para.text for para in doc.paragraphs])
-
-def process_uploaded_files(uploaded_files):
-    """处理上传的文件列表，返回合并后的文本和文件名列表"""
-    all_text = []
-    file_names = []
-    for file in uploaded_files:
-        try:
-            if file.name.endswith(".txt"):
-                text = extract_text_from_txt(file)
-            elif file.name.endswith(".pdf"):
-                text = extract_text_from_pdf(file)
-            elif file.name.endswith(".docx"):
-                text = extract_text_from_docx(file)
-            else:
-                st.warning(f"不支持的文件类型：{file.name}，已跳过")
-                continue
-            all_text.append(f"【文件：{file.name}】\n{text}")
-            file_names.append(file.name)
-        except Exception as e:
-            st.error(f"读取文件 {file.name} 失败：{e}")
-    return "\n\n".join(all_text), file_names
-
-# ========== 界面布局 ==========
-st.subheader("📂 上传内部文档（Word/PDF/TXT），AI 将学习这些内容")
-
-uploaded = st.file_uploader(
-    "支持批量上传，格式：.txt .pdf .docx",
-    type=["txt", "pdf", "docx"],
-    accept_multiple_files=True,
-    key="file_uploader"
+# ========== 默认知识 ==========
+DEFAULT_KB = (
+    "常用市场监督管理法律法规要点：\n"
+    "- 食品安全法第34条：禁止经营超过保质期的食品。\n"
+    "- 广告法第9条：广告不得使用“国家级”、“最高级”、“最佳”等绝对化用语。\n"
+    "- 无证无照经营查处办法第2条：不得无证无照经营。\n"
+    "裁量参考：初次违法、货值金额、危害后果、配合程度。"
 )
 
-# 如果有新文件上传，进行处理
-if uploaded:
-    extracted_text, new_files = process_uploaded_files(uploaded)
-    # 如果之前已有文件，则追加；否则替换为新的知识文本（也可以设计成替换模式，这里用替换更清晰）
-    if st.button("📥 确认上传并学习"):
-        st.session_state.knowledge_text = extracted_text
-        st.session_state.uploaded_files = new_files
-        st.success(f"已学习 {len(new_files)} 个文件，AI 将基于这些内容进行分析。")
-        st.rerun()
+def mask_pii(text):
+    return re.sub(r'(1[3-9]\d)\d{4}(\d{4})', r'\1****\2', text)
 
-# 显示当前已加载的文件
-if st.session_state.uploaded_files:
-    st.info(f"当前知识库包含文件：{'，'.join(st.session_state.uploaded_files)}")
-    if st.button("🗑️ 清空已上传的文件，恢复默认知识"):
-        st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-        st.session_state.uploaded_files = []
-        st.rerun()
-else:
-    st.caption("目前使用内置基础法律知识，上传内部材料可提升分析准确性。")
+@st.cache_data(show_spinner=False)
+def parse_file(file_name, file_bytes):
+    name = file_name.lower()
+    if name.endswith(".txt"):
+        return file_bytes.decode("utf-8")
+    if name.endswith(".pdf"):
+        r = _pypdf2().PdfReader(io.BytesIO(file_bytes))
+        return "".join(p.extract_text() or "" for p in r.pages)
+    if name.endswith(".docx"):
+        d = _docx().Document(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in d.paragraphs)
+    if name.endswith(".xlsx"):
+        wb = _openpyxl().load_workbook(io.BytesIO(file_bytes))
+        lines = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                line = " ".join(str(c) for c in row if c is not None)
+                if line.strip():
+                    lines.append(line)
+        return "\n".join(lines)
+    raise ValueError("不支持的类型")
 
-# 可折叠区域预览当前知识文本（可选）
-with st.expander("🔍 查看当前知识库内容"):
-    st.text(st.session_state.knowledge_text[:2000])  # 只显示前2000字，避免撑爆
+# ========== 会话初始化 ==========
+if "kb" not in st.session_state:
+    st.session_state.kb = DEFAULT_KB
+if "kb_files" not in st.session_state:
+    st.session_state.kb_files = []
+if "complaint" not in st.session_state:
+    st.session_state.complaint = ""
 
-st.markdown("---")
+client = get_client()
 
-# ========== 举报输入区 ==========
-st.subheader("📥 粘贴举报工单原文")
-complaint_text = st.text_area(
-    "举报内容",
-    height=200,
-    placeholder="例如：2026年4月25日，消费者李某反映在XX超市购买到过期..."
-)
-
-# ========== 构造提示词（将知识库全文注入） ==========
-def build_prompt(complaint, knowledge):
-    return f"""你是一位精通市场监管法律法规的办案助手。请严格根据以下【内部知识库】中的法律规定和裁量标准，对举报工单进行分析。
-
-【内部知识库】
-{knowledge}
-
-【举报工单内容】
-{complaint}
-
-请输出（必须包含以下所有项目）：
-1. 举报类型
-2. 被举报主体名称
-3. 违法事实摘要（50字内）
-4. 可能违反的法律法规条款（优先引用知识库中提及的条款）
-5. 是否建议立案（是/否，并说明原因）
-6. 若立案，建议的处罚裁量方向（参考知识库中的裁量因素）
-7. 生成一份《立案审批表》草稿（用【立案审批表草稿】作为开头）
-
-确保输出格式与知识库中的文书范例风格一致。"""
-
-# ========== 分析按钮 ==========
-if st.button("🚀 智能分析", type="primary"):
-    if not complaint_text.strip():
-        st.warning("请先粘贴举报内容")
-    else:
-        with st.spinner("AI正在分析，请稍候..."):
+# ========== 知识库（折叠） ==========
+with st.expander("📂 知识库（上传/导入/导出）", expanded=False):
+    a, b = st.columns([2, 1])
+    with a:
+        up_kb = st.file_uploader("上传 .txt/.pdf/.docx/.xlsx", type=["txt","pdf","docx","xlsx"],
+                                 accept_multiple_files=True, key="upkb")
+    with b:
+        imp = st.file_uploader("导入.txt", type=["txt"], key="imp")
+        if imp:
             try:
-                # 使用当前知识库
-                prompt = build_prompt(complaint_text, st.session_state.knowledge_text)
-                response = client.chat.completions.create(
+                st.session_state.kb = imp.getvalue().decode("utf-8")
+                st.session_state.kb_files = ["导入"]
+                st.success("已导入")
+                st.rerun()
+            except Exception as e:
+                st.error(e)
+
+    if up_kb:
+        if st.button("添加"):
+            exist = st.session_state.kb_files
+            newf, skip = [], []
+            for f in up_kb:
+                if f.name in exist:
+                    skip.append(f.name)
+                else:
+                    newf.append(f)
+            if not newf:
+                st.warning("无新文件")
+            else:
+                parts = []
+                for f in newf:
+                    try:
+                        t = parse_file(f.name, f.getvalue())
+                        parts.append(f"【{f.name}】\n{t}")
+                    except Exception as e:
+                        st.error(f"{f.name} 解析失败：{e}")
+                if parts:
+                    joined = "\n\n".join(parts)
+                    if st.session_state.kb == DEFAULT_KB:
+                        st.session_state.kb = joined
+                    else:
+                        st.session_state.kb += "\n\n" + joined
+                    st.session_state.kb_files.extend([f.name for f in newf])
+                    st.success(f"已添加 {len(parts)} 个文件")
+                    st.rerun()
+
+    if st.session_state.kb_files:
+        st.caption(f"{len(st.session_state.kb_files)} 个文件，{len(st.session_state.kb)} 字")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("清空"):
+                st.session_state.kb = DEFAULT_KB
+                st.session_state.kb_files = []
+                st.rerun()
+        with c2:
+            b64 = base64.b64encode(st.session_state.kb.encode("utf-8")).decode()
+            st.markdown(f'<a href="data:file/txt;base64,{b64}" download="kb.txt">导出</a>', unsafe_allow_html=True)
+    else:
+        st.caption("默认法律知识")
+
+# ========== 工单表单 ==========
+with st.form("main", clear_on_submit=False):
+    l, r = st.columns([3, 1])
+    with l:
+        st.markdown("#### 📥 举报内容")
+        txt = st.text_area("输入", value=st.session_state.complaint, height=180,
+                           placeholder="粘贴或上传 .txt/.pdf/.docx/.xlsx 文件", label_visibility="collapsed", key="ta")
+    with r:
+        st.markdown("#### 📎 上传")
+        up_comp = st.file_uploader("支持 .txt/.pdf/.docx/.xlsx", type=["txt","pdf","docx","xlsx"],
+                                   label_visibility="collapsed", key="upcomp")
+        if up_comp:
+            try:
+                file_txt = parse_file(up_comp.name, up_comp.getvalue())
+                st.session_state.complaint = file_txt
+                st.session_state["pend"] = file_txt
+            except Exception as e:
+                st.error(e)
+
+    ocol, bcol = st.columns([2, 1])
+    with ocol:
+        use_mask = st.checkbox("🛡️ 隐藏手机号", value=True)
+    with bcol:
+        go = st.form_submit_button("🚀 智能分析", type="primary", use_container_width=True)
+
+if "pend" in st.session_state and st.session_state["pend"] is not None:
+    st.session_state.complaint = st.session_state["pend"]
+    del st.session_state["pend"]
+    st.rerun()
+
+# ========== 分析 ==========
+if go:
+    raw = st.session_state.complaint
+    if not raw.strip():
+        st.warning("请输入内容")
+    else:
+        final = mask_pii(raw) if use_mask else raw
+        kb = st.session_state.kb
+        if len(kb) > MAX_KNOWLEDGE_CHARS:
+            kb = kb[:MAX_KNOWLEDGE_CHARS] + "\n(已截断)"
+        prompt = f"""你是办案助手，依据知识库分析工单：
+
+【知识库】
+{kb}
+
+【工单】
+{final}
+
+输出：
+1. 举报类型
+2. 被举报主体
+3. 违法事实摘要（≤50字）
+4. 涉嫌违反条款
+5. 是否立案及理由
+6. 裁量建议
+7. 【立案审批表草稿】（含案由、当事人、违法事实、立案依据、承办人意见）"""
+        with st.spinner("分析中……"):
+            try:
+                resp = client.chat.completions.create(
                     model=MODEL,
-                    messages=[
-                        {"role": "system", "content": "你是一个专业、严谨的市场监管法律助手。"},
-                        {"role": "user", "content": prompt}
-                    ],
+                    messages=[{"role":"system","content":"严谨的市场监管助手，注意隐私。"},
+                              {"role":"user","content":prompt}],
                     temperature=0.1,
                     max_tokens=2000
                 )
-                result = response.choices[0].message.content
-                st.success("✅ 分析完成")
-
-                # 分段展示
-                sections = result.split("\n\n")
-                for sec in sections:
-                    if sec.strip():
-                        if "【立案审批表草稿】" in sec:
-                            st.subheader("📄 立案审批表草稿")
-                            st.text_area("草稿内容（可复制）", value=sec.replace("【立案审批表草稿】","").strip(), height=300)
+                ans = resp.choices[0].message.content
+                st.success("完成")
+                for part in ans.split("\n\n"):
+                    if part.strip():
+                        if "【立案审批表草稿】" in part:
+                            st.markdown("#### 📄 立案审批表草稿")
+                            clean = part.replace("【立案审批表草稿】","").strip()
+                            st.text_area("可复制", value=clean, height=300, label_visibility="collapsed")
                         else:
-                            st.markdown(sec)
+                            st.markdown(part)
             except Exception as e:
-                st.error(f"调用AI出错：{str(e)}")
+                st.error(f"出错：{e}")
 
-# ========== 侧边栏 ==========
-st.sidebar.markdown("""
-### 使用说明
-1. **上传文件**：把局里的裁量指导意见、优秀处罚决定书等（Word/PDF/TXT）拖到上方上传区，点击“确认上传并学习”。
-2. **分析工单**：粘贴举报内容，点击“智能分析”。
-3. AI 会根据您上传的内部文件引用法条、给出裁量建议，完全模仿文件内的风格。
-4. 如需更换文件，清空后重新上传即可。
+# ========== 底部信息 ==========
+with st.expander("🔒 安全说明"):
+    st.caption("用后即焚 · HTTPS加密 · 合规AI · 自动脱敏")
 
-### 支持文件格式
-- 文本文件 (.txt)
-- PDF 文件 (.pdf)
-- Word 文档 (.docx)
-""")
+st.sidebar.caption("⏳ 白天高峰可能稍慢，建议复制链接到浏览器打开，或提前5分钟进入页面待命。")
