@@ -3,24 +3,19 @@ from openai import OpenAI
 import PyPDF2
 import docx
 import io
-import re
-import base64
 
 # ========== 配置区 ==========
 API_KEY = st.secrets["API_KEY"]
 MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
-MAX_KNOWLEDGE_CHARS = 4000          # 知识库截断长度
 # ============================
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-st.set_page_config(page_title="市监举报辅助系统", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="市监举报辅助系统", layout="wide")
+st.title("📋 举报工单智能分析与文书辅助")
 
-# 简洁标题
-st.markdown("## 📋 举报工单智能分析辅助工具")
-
-# ========== 内置默认知识 ==========
+# ========== 内置默认知识（当用户未上传文件时使用） ==========
 DEFAULT_KNOWLEDGE = """
 常用市场监督管理法律法规要点：
 - 食品安全法第34条：禁止经营超过保质期的食品。
@@ -29,222 +24,156 @@ DEFAULT_KNOWLEDGE = """
 裁量参考因素：初次违法、货值金额、危害后果、是否主动消除影响、配合调查程度等。
 """
 
-# ========== 脱敏函数 ==========
-def mask_pii(text):
-    return re.sub(r'(1[3-9]\d)\d{4}(\d{4})', r'\1****\2', text)
-
-# ========== 文件解析（含缓存） ==========
-@st.cache_data(show_spinner=False)
-def parse_file_bytes(file_name, file_bytes):
-    name = file_name.lower()
-    if name.endswith(".txt"):
-        return file_bytes.decode("utf-8")
-    elif name.endswith(".pdf"):
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        text = ""
-        for page in pdf_reader.pages:
-            if page.extract_text():
-                text += page.extract_text()
-        return text
-    elif name.endswith(".docx"):
-        doc = docx.Document(io.BytesIO(file_bytes))
-        return "\n".join([para.text for para in doc.paragraphs])
-    else:
-        raise ValueError("不支持的文件类型")
-
-# ========== 会话状态初始化 ==========
+# ========== 初始化 session_state ==========
 if "knowledge_text" not in st.session_state:
     st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-if "loaded_files" not in st.session_state:
-    st.session_state.loaded_files = []
-if "raw_complaint" not in st.session_state:
-    st.session_state.raw_complaint = ""
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = []  # 记录文件名列表
 
-# ========== 知识库管理区（紧凑布局） ==========
-with st.expander("📂 知识库管理（上传内部文件 / 导入导出）", expanded=False):
-    col1, col2 = st.columns(2)
-    with col1:
-        uploaded_knowledge = st.file_uploader("上传文件（支持 .txt .pdf .docx）",
-                                              type=["txt", "pdf", "docx"],
-                                              accept_multiple_files=True,
-                                              key="knowledge_uploader")
-    with col2:
-        uploaded_import = st.file_uploader("导入已导出的知识库",
-                                           type=["txt"],
-                                           key="knowledge_import")
-        if uploaded_import:
-            try:
-                imported = uploaded_import.getvalue().decode("utf-8")
-                st.session_state.knowledge_text = imported
-                st.session_state.loaded_files = ["导入的知识库"]
-                st.success("知识库已导入")
-                st.rerun()
-            except Exception as e:
-                st.error(f"导入失败：{e}")
+# ========== 文件解析函数 ==========
+def extract_text_from_txt(file):
+    return file.getvalue().decode("utf-8")
 
-    if uploaded_knowledge:
-        if st.button("确认添加至知识库"):
-            existing = st.session_state.loaded_files
-            new_files = []
-            skipped = []
-            for f in uploaded_knowledge:
-                if f.name in existing:
-                    skipped.append(f.name)
-                else:
-                    new_files.append(f)
-            if not new_files:
-                st.warning("本次上传的文件均已存在")
+def extract_text_from_pdf(file):
+    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.getvalue()))
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def extract_text_from_docx(file):
+    doc = docx.Document(io.BytesIO(file.getvalue()))
+    return "\n".join([para.text for para in doc.paragraphs])
+
+def process_uploaded_files(uploaded_files):
+    """处理上传的文件列表，返回合并后的文本和文件名列表"""
+    all_text = []
+    file_names = []
+    for file in uploaded_files:
+        try:
+            if file.name.endswith(".txt"):
+                text = extract_text_from_txt(file)
+            elif file.name.endswith(".pdf"):
+                text = extract_text_from_pdf(file)
+            elif file.name.endswith(".docx"):
+                text = extract_text_from_docx(file)
             else:
-                new_texts = []
-                for f in new_files:
-                    try:
-                        text = parse_file_bytes(f.name, f.getvalue())
-                        new_texts.append(f"【{f.name}】\n{text}")
-                    except Exception as e:
-                        st.error(f"解析 {f.name} 失败：{e}")
-                if new_texts:
-                    if st.session_state.knowledge_text == DEFAULT_KNOWLEDGE:
-                        st.session_state.knowledge_text = "\n\n".join(new_texts)
-                    else:
-                        st.session_state.knowledge_text += "\n\n" + "\n\n".join(new_texts)
-                    st.session_state.loaded_files.extend([f.name for f in new_files])
-                    st.success(f"已添加 {len(new_texts)} 个文件")
-                    st.rerun()
+                st.warning(f"不支持的文件类型：{file.name}，已跳过")
+                continue
+            all_text.append(f"【文件：{file.name}】\n{text}")
+            file_names.append(file.name)
+        except Exception as e:
+            st.error(f"读取文件 {file.name} 失败：{e}")
+    return "\n\n".join(all_text), file_names
 
-    # 显示知识库状态
-    if st.session_state.loaded_files:
-        col_a, col_b, col_c = st.columns([2, 1, 1])
-        with col_a:
-            st.caption(f"已加载 {len(st.session_state.loaded_files)} 个文件，总字数 {len(st.session_state.knowledge_text)}")
-        with col_b:
-            if st.button("清空知识库", key="clear_kb"):
-                st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-                st.session_state.loaded_files = []
-                st.rerun()
-        with col_c:
-            kb_bytes = st.session_state.knowledge_text.encode("utf-8")
-            b64 = base64.b64encode(kb_bytes).decode()
-            href = f'<a href="data:file/txt;base64,{b64}" download="knowledge_base.txt">导出知识库</a>'
-            st.markdown(href, unsafe_allow_html=True)
-    else:
-        st.caption("当前使用默认法律知识，可上传文件构建专属知识库")
+# ========== 界面布局 ==========
+st.subheader("📂 上传内部文档（Word/PDF/TXT），AI 将学习这些内容")
 
-# ========== 工单输入与分析（核心表单） ==========
+uploaded = st.file_uploader(
+    "支持批量上传，格式：.txt .pdf .docx",
+    type=["txt", "pdf", "docx"],
+    accept_multiple_files=True,
+    key="file_uploader"
+)
+
+# 如果有新文件上传，进行处理
+if uploaded:
+    extracted_text, new_files = process_uploaded_files(uploaded)
+    # 如果之前已有文件，则追加；否则替换为新的知识文本（也可以设计成替换模式，这里用替换更清晰）
+    if st.button("📥 确认上传并学习"):
+        st.session_state.knowledge_text = extracted_text
+        st.session_state.uploaded_files = new_files
+        st.success(f"已学习 {len(new_files)} 个文件，AI 将基于这些内容进行分析。")
+        st.rerun()
+
+# 显示当前已加载的文件
+if st.session_state.uploaded_files:
+    st.info(f"当前知识库包含文件：{'，'.join(st.session_state.uploaded_files)}")
+    if st.button("🗑️ 清空已上传的文件，恢复默认知识"):
+        st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
+        st.session_state.uploaded_files = []
+        st.rerun()
+else:
+    st.caption("目前使用内置基础法律知识，上传内部材料可提升分析准确性。")
+
+# 可折叠区域预览当前知识文本（可选）
+with st.expander("🔍 查看当前知识库内容"):
+    st.text(st.session_state.knowledge_text[:2000])  # 只显示前2000字，避免撑爆
+
 st.markdown("---")
-with st.form("main_form", clear_on_submit=False):
-    left, right = st.columns([3, 1])
-    with left:
-        st.markdown("#### 📥 举报工单内容")
-        complaint_text = st.text_area(
-            "输入或粘贴举报内容",
-            value=st.session_state.raw_complaint,
-            height=180,
-            placeholder="如：2026年4月25日，李某（电话13812345678）反映在XX超市购买到过期食品……",
-            label_visibility="collapsed",
-            key="complaint_area"
-        )
-    with right:
-        st.markdown("#### 📎 上传工单文件")
-        uploaded_complaint = st.file_uploader(
-            "支持 .txt .pdf .docx",
-            type=["txt", "pdf", "docx"],
-            label_visibility="collapsed",
-            key="complaint_upload"
-        )
-        if uploaded_complaint is not None:
-            try:
-                file_text = parse_file_bytes(uploaded_complaint.name, uploaded_complaint.getvalue())
-                st.session_state.raw_complaint = file_text
-                # 使用一个标志，在表单外刷新
-                st.session_state["pending_file"] = file_text
-            except Exception as e:
-                st.error(f"解析失败：{e}")
 
-    # 脱敏选项与分析按钮同行
-    col_opt, col_btn = st.columns([2, 1])
-    with col_opt:
-        use_mask = st.checkbox("🛡️ 自动隐藏举报内容中的手机号（推荐）", value=True)
-    with col_btn:
-        submitted = st.form_submit_button("🚀 开始智能分析", type="primary", use_container_width=True)
+# ========== 举报输入区 ==========
+st.subheader("📥 粘贴举报工单原文")
+complaint_text = st.text_area(
+    "举报内容",
+    height=200,
+    placeholder="例如：2026年4月25日，消费者李某反映在XX超市购买到过期..."
+)
 
-# 处理文件上传后刷新
-if "pending_file" in st.session_state and st.session_state["pending_file"] is not None:
-    st.session_state.raw_complaint = st.session_state["pending_file"]
-    del st.session_state["pending_file"]
-    st.rerun()
+# ========== 构造提示词（将知识库全文注入） ==========
+def build_prompt(complaint, knowledge):
+    return f"""你是一位精通市场监管法律法规的办案助手。请严格根据以下【内部知识库】中的法律规定和裁量标准，对举报工单进行分析。
 
-# ========== 分析结果展示 ==========
-if submitted:
-    final_text = st.session_state.raw_complaint
-    if not final_text.strip():
-        st.warning("请先输入举报内容")
-    else:
-        if use_mask:
-            final_text = mask_pii(final_text)
+【内部知识库】
+{knowledge}
 
-        # 截断知识库
-        full_kb = st.session_state.knowledge_text
-        if len(full_kb) > MAX_KNOWLEDGE_CHARS:
-            kb_section = full_kb[:MAX_KNOWLEDGE_CHARS] + "\n...(知识库已截断)"
-        else:
-            kb_section = full_kb
+【举报工单内容】
+{complaint}
 
-        prompt = f"""你是精通市场监管法规的办案助手，请依据以下知识库分析举报工单，并严格按格式输出：
-
-【知识库】
-{kb_section}
-
-【工单内容】
-{final_text}
-
-输出必须包含：
+请输出（必须包含以下所有项目）：
 1. 举报类型
-2. 被举报主体
+2. 被举报主体名称
 3. 违法事实摘要（50字内）
-4. 涉嫌违反条款（优先知识库内条文）
-5. 是否建议立案及理由
-6. 裁量建议（参照知识库裁量因素）
-7. 【立案审批表草稿】（完整草稿，含案由、当事人、违法事实、立案依据、承办人意见）"""
+4. 可能违反的法律法规条款（优先引用知识库中提及的条款）
+5. 是否建议立案（是/否，并说明原因）
+6. 若立案，建议的处罚裁量方向（参考知识库中的裁量因素）
+7. 生成一份《立案审批表》草稿（用【立案审批表草稿】作为开头）
 
-        with st.spinner("AI 正在分析并生成文书，请稍候..."):
+确保输出格式与知识库中的文书范例风格一致。"""
+
+# ========== 分析按钮 ==========
+if st.button("🚀 智能分析", type="primary"):
+    if not complaint_text.strip():
+        st.warning("请先粘贴举报内容")
+    else:
+        with st.spinner("AI正在分析，请稍候..."):
             try:
+                # 使用当前知识库
+                prompt = build_prompt(complaint_text, st.session_state.knowledge_text)
                 response = client.chat.completions.create(
                     model=MODEL,
                     messages=[
-                        {"role": "system", "content": "你是一位严谨的市场监管法律助手，注意隐私保护。"},
+                        {"role": "system", "content": "你是一个专业、严谨的市场监管法律助手。"},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
                     max_tokens=2000
                 )
                 result = response.choices[0].message.content
-                st.success("分析完成")
+                st.success("✅ 分析完成")
 
                 # 分段展示
-                parts = result.split("\n\n")
-                for part in parts:
-                    if part.strip():
-                        if "【立案审批表草稿】" in part:
-                            st.markdown("#### 📄 立案审批表草稿")
-                            clean = part.replace("【立案审批表草稿】", "").strip()
-                            st.text_area("草稿（可复制）", value=clean, height=300, label_visibility="collapsed")
+                sections = result.split("\n\n")
+                for sec in sections:
+                    if sec.strip():
+                        if "【立案审批表草稿】" in sec:
+                            st.subheader("📄 立案审批表草稿")
+                            st.text_area("草稿内容（可复制）", value=sec.replace("【立案审批表草稿】","").strip(), height=300)
                         else:
-                            st.markdown(part)
+                            st.markdown(sec)
             except Exception as e:
-                st.error(f"AI 调用出错：{e}")
+                st.error(f"调用AI出错：{str(e)}")
 
-# ========== 底部安全说明（简洁折叠） ==========
-st.markdown("---")
-with st.expander("🔒 数据安全说明"):
-    st.markdown("- 用后即焚：关闭页面后所有数据消失，服务器不保留")
-    st.markdown("- 传输加密：全程 HTTPS 加密，与网银同级")
-    st.markdown("- AI 合规：使用已备案的 DeepSeek，不利用用户数据训练")
-    st.markdown("- 自动脱敏：手机号中间四位变星号，分析时已预处理")
-
-# ========== 侧边栏（极简提示） ==========
+# ========== 侧边栏 ==========
 st.sidebar.markdown("""
-**📌 使用提示**
-- 知识库上传后可导出保存，下次导入即可复用。
-- 微信内打开较慢，建议复制链接到手机浏览器使用。
-- 系统默认隐藏手机号，可手动取消勾选。
+### 使用说明
+1. **上传文件**：把局里的裁量指导意见、优秀处罚决定书等（Word/PDF/TXT）拖到上方上传区，点击“确认上传并学习”。
+2. **分析工单**：粘贴举报内容，点击“智能分析”。
+3. AI 会根据您上传的内部文件引用法条、给出裁量建议，完全模仿文件内的风格。
+4. 如需更换文件，清空后重新上传即可。
+
+### 支持文件格式
+- 文本文件 (.txt)
+- PDF 文件 (.pdf)
+- Word 文档 (.docx)
 """)
