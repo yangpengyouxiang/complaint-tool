@@ -15,7 +15,7 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 st.set_page_config(page_title="市监举报辅助系统", layout="wide")
 st.title("📋 举报工单智能分析与文书辅助")
 
-# ========== 内置默认知识（当用户未上传文件时使用） ==========
+# ========== 内置默认知识 ==========
 DEFAULT_KNOWLEDGE = """
 常用市场监督管理法律法规要点：
 - 食品安全法第34条：禁止经营超过保质期的食品。
@@ -27,10 +27,10 @@ DEFAULT_KNOWLEDGE = """
 # ========== 初始化 session_state ==========
 if "knowledge_text" not in st.session_state:
     st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []  # 记录文件名列表
+if "loaded_files" not in st.session_state:
+    st.session_state.loaded_files = []   # 记录已加载的文件名
 
-# ========== 文件解析函数 ==========
+# ========== 文件解析函数（不变） ==========
 def extract_text_from_txt(file):
     return file.getvalue().decode("utf-8")
 
@@ -46,9 +46,9 @@ def extract_text_from_docx(file):
     return "\n".join([para.text for para in doc.paragraphs])
 
 def process_uploaded_files(uploaded_files):
-    """处理上传的文件列表，返回合并后的文本和文件名列表"""
-    all_text = []
-    file_names = []
+    """处理上传文件，返回(新提取文本, 新文件名列表)"""
+    new_texts = []
+    new_names = []
     for file in uploaded_files:
         try:
             if file.name.endswith(".txt"):
@@ -60,14 +60,14 @@ def process_uploaded_files(uploaded_files):
             else:
                 st.warning(f"不支持的文件类型：{file.name}，已跳过")
                 continue
-            all_text.append(f"【文件：{file.name}】\n{text}")
-            file_names.append(file.name)
+            new_texts.append(f"【文件：{file.name}】\n{text}")
+            new_names.append(file.name)
         except Exception as e:
             st.error(f"读取文件 {file.name} 失败：{e}")
-    return "\n\n".join(all_text), file_names
+    return "\n\n".join(new_texts), new_names
 
 # ========== 界面布局 ==========
-st.subheader("📂 上传内部文档（Word/PDF/TXT），AI 将学习这些内容")
+st.subheader("📂 上传内部文档（Word/PDF/TXT），AI 将持续学习")
 
 uploaded = st.file_uploader(
     "支持批量上传，格式：.txt .pdf .docx",
@@ -76,29 +76,58 @@ uploaded = st.file_uploader(
     key="file_uploader"
 )
 
-# 如果有新文件上传，进行处理
+# ========== 处理上传按钮 ==========
 if uploaded:
-    extracted_text, new_files = process_uploaded_files(uploaded)
-    # 如果之前已有文件，则追加；否则替换为新的知识文本（也可以设计成替换模式，这里用替换更清晰）
-    if st.button("📥 确认上传并学习"):
-        st.session_state.knowledge_text = extracted_text
-        st.session_state.uploaded_files = new_files
-        st.success(f"已学习 {len(new_files)} 个文件，AI 将基于这些内容进行分析。")
-        st.rerun()
+    if st.button("📥 确认添加至知识库"):
+        # 先过滤掉已存在的文件
+        existing = st.session_state.loaded_files
+        new_files = []
+        skipped = []
+        for f in uploaded:
+            if f.name in existing:
+                skipped.append(f.name)
+            else:
+                new_files.append(f)
+        
+        if not new_files:
+            st.warning("本次上传的文件都已存在于知识库中，未添加新内容。")
+        else:
+            # 提取新文件文本
+            extracted_text, added_names = process_uploaded_files(new_files)
+            # 追加到现有知识库
+            if st.session_state.knowledge_text == DEFAULT_KNOWLEDGE:
+                # 如果当前还是默认知识，先清空再添加（避免默认知识和文件混合导致提示词过长，也可保留默认；这里选择替换默认）
+                st.session_state.knowledge_text = extracted_text
+            else:
+                st.session_state.knowledge_text += "\n\n" + extracted_text
+            # 更新已加载文件列表
+            st.session_state.loaded_files.extend(added_names)
+            msg = f"已添加 {len(added_names)} 个文件：{'，'.join(added_names)}"
+            if skipped:
+                msg += f"。跳过了 {len(skipped)} 个重复文件：{'，'.join(skipped)}"
+            st.success(msg)
+            st.rerun()
 
-# 显示当前已加载的文件
-if st.session_state.uploaded_files:
-    st.info(f"当前知识库包含文件：{'，'.join(st.session_state.uploaded_files)}")
-    if st.button("🗑️ 清空已上传的文件，恢复默认知识"):
-        st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
-        st.session_state.uploaded_files = []
-        st.rerun()
+# 显示已加载文件列表
+if st.session_state.loaded_files:
+    st.info(f"📚 当前知识库包含 {len(st.session_state.loaded_files)} 个文件：{'，'.join(st.session_state.loaded_files)}")
 else:
-    st.caption("目前使用内置基础法律知识，上传内部材料可提升分析准确性。")
+    st.caption("目前使用内置基础法律知识，上传内部材料可逐步构建专属知识库。")
 
-# 可折叠区域预览当前知识文本（可选）
-with st.expander("🔍 查看当前知识库内容"):
-    st.text(st.session_state.knowledge_text[:2000])  # 只显示前2000字，避免撑爆
+# 按钮：清空知识库
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("🗑️ 清空知识库，恢复默认"):
+        st.session_state.knowledge_text = DEFAULT_KNOWLEDGE
+        st.session_state.loaded_files = []
+        st.rerun()
+with col2:
+    # 可预览当前知识库总字数
+    st.caption(f"知识库总字数：{len(st.session_state.knowledge_text)}")
+
+# 可折叠查看知识库内容
+with st.expander("🔍 查看当前知识库前2000字"):
+    st.text(st.session_state.knowledge_text[:2000])
 
 st.markdown("---")
 
@@ -110,7 +139,7 @@ complaint_text = st.text_area(
     placeholder="例如：2026年4月25日，消费者李某反映在XX超市购买到过期..."
 )
 
-# ========== 构造提示词（将知识库全文注入） ==========
+# ========== 构造提示词 ==========
 def build_prompt(complaint, knowledge):
     return f"""你是一位精通市场监管法律法规的办案助手。请严格根据以下【内部知识库】中的法律规定和裁量标准，对举报工单进行分析。
 
@@ -138,7 +167,6 @@ if st.button("🚀 智能分析", type="primary"):
     else:
         with st.spinner("AI正在分析，请稍候..."):
             try:
-                # 使用当前知识库
                 prompt = build_prompt(complaint_text, st.session_state.knowledge_text)
                 response = client.chat.completions.create(
                     model=MODEL,
@@ -152,7 +180,6 @@ if st.button("🚀 智能分析", type="primary"):
                 result = response.choices[0].message.content
                 st.success("✅ 分析完成")
 
-                # 分段展示
                 sections = result.split("\n\n")
                 for sec in sections:
                     if sec.strip():
@@ -167,10 +194,10 @@ if st.button("🚀 智能分析", type="primary"):
 # ========== 侧边栏 ==========
 st.sidebar.markdown("""
 ### 使用说明
-1. **上传文件**：把局里的裁量指导意见、优秀处罚决定书等（Word/PDF/TXT）拖到上方上传区，点击“确认上传并学习”。
-2. **分析工单**：粘贴举报内容，点击“智能分析”。
-3. AI 会根据您上传的内部文件引用法条、给出裁量建议，完全模仿文件内的风格。
-4. 如需更换文件，清空后重新上传即可。
+1. **逐步添砖加瓦**：每次上传新内部文件（Word/PDF/TXT），点击“确认添加至知识库”，内容会**累积**而不是覆盖。
+2. 同名文件不会重复添加，系统会自动跳过。
+3. 点击“清空知识库”可一键恢复初始状态。
+4. 粘贴工单后点击分析，AI会基于您上传的全部文件进行辅助。
 
 ### 支持文件格式
 - 文本文件 (.txt)
